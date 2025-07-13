@@ -1,0 +1,100 @@
+My db 2
+
+SELECT 
+  MEMBER,
+  SUBSTR(STMT_TEXT, 1, 200) AS SQL_TEXT,
+  NUM_EXECUTIONS,
+  TOTAL_CPU_TIME / 1000 AS CPU_SEC,
+  TOTAL_ACT_TIME / 1000 AS EXEC_TIME_SEC,
+  SORT_OVERFLOWS,
+  TOTAL_SORT_TIME / 1000 AS SORT_TIME_SEC
+FROM TABLE(MON_GET_PKG_CACHE_STMT(NULL, NULL, NULL, -2))
+WHERE 
+  TOTAL_CPU_TIME > 300000 OR        -- CPU > 5 mins
+  TOTAL_ACT_TIME > 600000 OR        -- Execution > 10 mins
+  SORT_OVERFLOWS > 5                -- Sort overflow
+ORDER BY TOTAL_ACT_TIME DESC
+FETCH FIRST 20 ROWS ONLY;
+
+Other 
+
+WITH
+-- CPU or long-running queries
+TopCPU AS (
+  SELECT MEMBER, COUNT(*) AS high_cpu_queries
+  FROM TABLE(MON_GET_PKG_CACHE_STMT(NULL, NULL, NULL, -2))
+  WHERE TOTAL_CPU_TIME > 300000  -- >5 mins CPU
+     OR TOTAL_ACT_TIME > 600000  -- >10 mins wall time
+  GROUP BY MEMBER
+),
+
+-- Wait time analysis
+TopWaits AS (
+  SELECT MEMBER,
+         MAX(WAIT_TIME_TOTAL) AS max_wait_ms,
+         MAX(WAIT_NAME) AS worst_wait_type
+  FROM TABLE(MON_GET_DATABASE(-2))
+  GROUP BY MEMBER
+),
+
+-- Bufferpool low hit ratio
+LowBufferHit AS (
+  SELECT MEMBER, BP_NAME, 
+         DEC((POOL_DATA_L_READS - POOL_DATA_P_READS) * 100.0 / NULLIF(POOL_DATA_L_READS, 0), 5,2) AS hit_ratio
+  FROM TABLE(MON_GET_BUFFERPOOL(NULL, -2))
+  WHERE (POOL_DATA_L_READS - POOL_DATA_P_READS) * 100.0 / NULLIF(POOL_DATA_L_READS, 1) < 90
+),
+
+-- Sort overflow detection
+SortIssues AS (
+  SELECT MEMBER, COUNT(*) AS sort_overflows
+  FROM TABLE(MON_GET_PKG_CACHE_STMT(NULL, NULL, NULL, -2))
+  WHERE SORT_OVERFLOWS > 5
+  GROUP BY MEMBER
+),
+
+-- Lock wait detection
+LockWaits AS (
+  SELECT MEMBER, COUNT(*) AS blocked_sessions
+  FROM TABLE(SNAPSHOT_LOCKWAIT(NULL))
+  GROUP BY MEMBER
+),
+
+-- Log pressure
+LogUsage AS (
+  SELECT MEMBER,
+         TOTAL_LOG_USED_KB,
+         TOTAL_LOG_AVAILABLE_KB,
+         DEC(TOTAL_LOG_USED_KB * 100.0 / TOTAL_LOG_AVAILABLE_KB, 5,2) AS usage_pct
+  FROM TABLE(MON_GET_TRANSACTION_LOG(-2))
+  WHERE TOTAL_LOG_USED_KB * 100.0 / TOTAL_LOG_AVAILABLE_KB > 80
+)
+
+-- Final diagnostic
+SELECT 
+  COALESCE(c.MEMBER, w.MEMBER, b.MEMBER, s.MEMBER, l.MEMBER, g.MEMBER) AS MEMBER,
+  COALESCE(c.high_cpu_queries, 0) AS CPU_ISSUES,
+  COALESCE(w.max_wait_ms / 1000, 0) AS MAX_WAIT_SEC,
+  COALESCE(w.worst_wait_type, 'N/A') AS TOP_WAIT_EVENT,
+  COALESCE(b.hit_ratio, 100.00) AS BUFFER_HIT_RATIO,
+  COALESCE(s.sort_overflows, 0) AS SORT_OVERFLOWS,
+  COALESCE(l.blocked_sessions, 0) AS LOCK_BLOCKS,
+  COALESCE(g.usage_pct, 0.00) AS LOG_USAGE_PCT,
+
+  CASE 
+    WHEN c.high_cpu_queries > 0 THEN '⚠️ High CPU SQLs'
+    WHEN w.max_wait_ms > 30000 THEN '⏳ High DB Waits'
+    WHEN b.hit_ratio < 90 THEN '📉 Poor Bufferpool Usage'
+    WHEN s.sort_overflows > 5 THEN '📦 Sort Overflows'
+    WHEN l.blocked_sessions > 2 THEN '🔒 Lock Contention'
+    WHEN g.usage_pct > 85 THEN '📛 Log Space Pressure'
+    ELSE '✅ Healthy'
+  END AS DIAGNOSIS
+
+FROM TopCPU c
+FULL OUTER JOIN TopWaits w ON c.MEMBER = w.MEMBER
+FULL OUTER JOIN LowBufferHit b ON COALESCE(c.MEMBER, w.MEMBER) = b.MEMBER
+FULL OUTER JOIN SortIssues s ON COALESCE(c.MEMBER, w.MEMBER) = s.MEMBER
+FULL OUTER JOIN LockWaits l ON COALESCE(c.MEMBER, w.MEMBER) = l.MEMBER
+FULL OUTER JOIN LogUsage g ON COALESCE(c.MEMBER, w.MEMBER) = g.MEMBER
+ORDER BY MEMBER;
