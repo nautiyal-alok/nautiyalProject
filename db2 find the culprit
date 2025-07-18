@@ -70,6 +70,43 @@ LogUsage AS (
   WHERE TOTAL_LOG_USED_KB * 100.0 / TOTAL_LOG_AVAILABLE_KB > 80
 )
 
+Growth of R Team & Past Management Changes
+	1.	How do you view the past management changes impacting the growth trajectory of the RPE team? Are there any corrective strategies planned to get back on track?
+	2.	There were earlier travel plans intended to support RPE collaboration and visibility—do we foresee such initiatives being revived or restructured going forward?
+	3.	What is the leadership’s current vision for RPE’s long-term role within the broader organization, especially considering the delays in growth initiatives?
+	4.	Is there any plan to provide strategic or budgetary support to help RPE scale given its current resource constraints?
+
+⸻
+
+PF Team Ecosystem & Talent Retention in India
+	5.	Considering the PF team is entirely India-based, what steps can leadership take to create a more resilient ecosystem and reduce attrition pressure on senior members?
+	6.	Have there been any discussions about investing in long-term career paths, engagement, or upskilling initiatives for PF to improve retention?
+	7.	Is there an opportunity to diversify PF’s geographical footprint or provide exposure beyond India to improve morale and reduce isolation?
+	8.	Are we monitoring team morale and workload closely enough to anticipate potential exits before they happen?
+
+⸻
+
+RPE’s Current Situation & Application Complexity
+	9.	Given the RPE team is operating with very limited resources, is there a plan to acknowledge or reward the team’s resilience and tenure in maintaining such complex applications?
+	10.	Would it be possible to allocate more technical or architectural support to RPE given the complex nature of the application, to avoid burnout and mitigate risk?
+	11.	Are there any knowledge transfer or documentation efforts in progress to make RPE less reliant on a few long-tenured individuals?
+	12.	Is the current resource model for RPE sustainable in the long run, or should we re-evaluate it based on system complexity and business criticality?
+
+⸻
+
+Let me know if you’d like to tailor this further for a specific industry, tone (formal/informal), or include data points for more impact.
+
+
+Business-Critical Systems: The RPE team manages highly complex and critical applications that are deeply integrated into core business operations—any disruption would have significant downstream impact.
+	2.	Deep System Knowledge: Many of the systems supported by RPE are not easily transferable; the team’s long tenure and domain expertise are key to maintaining stability and avoiding operational risk.
+	3.	Resource Leverage vs. Load: Despite limited resources, RPE has consistently delivered with high reliability. This level of efficiency is only possible due to their deep familiarity with legacy systems—scaling or replacing that is not trivial.
+	4.	Talent Fragility: The recent exits in the PF team have already created pressure on senior team members. If this trend continues, we risk losing domain knowledge, which could lead to significant delays and productivity loss.
+	5.	India-Centric Dependency: With the PF team ecosystem entirely based in India, the lack of distributed risk makes it more vulnerable to attrition and burnout—retention must become a strategic priority.
+	6.	Unseen Value: Much of the work these teams do is behind-the-scenes but critical—they keep foundational platforms running smoothly, enabling other teams to innovate and deliver.
+	7.	Cost of Inaction: If these teams are not stabilized and supported now, the cost of rebuilding lost knowledge and trust could be exponentially higher later.
+
+
+
 -- Final diagnostic
 SELECT 
   COALESCE(c.MEMBER, w.MEMBER, b.MEMBER, s.MEMBER, l.MEMBER, g.MEMBER) AS MEMBER,
