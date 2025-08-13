@@ -1,0 +1,127 @@
+import pandas as pd
+import numpy as np
+import os
+import logging
+
+from datetime import datetime
+
+# ================== Configuration ==================
+input_file = 'input_data.xlsx'  # Excel file name
+sheet_name = 'Sheet1'  # Sheet to read
+output_dir = 'output_results'
+date_column = 'Date'
+group_column = 'Proc Name'
+metric_column = 'PerExTime'
+rolling_window = 5  # For Moving Average method
+z_threshold = 2.5  # Z-score threshold
+mad_threshold = 2.5  # MAD threshold
+iqr_multiplier = 1.5  # IQR multiplier
+
+# ================== Logging Setup ==================
+logging.basicConfig(filename='outlier_detection.log', level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# ================== Helper Functions ==================
+def safe_read_excel(file, sheet):
+    try:
+        df = pd.read_excel(file, sheet_name=sheet)
+        logging.info(f'Successfully read file: {file}')
+        return df
+    except Exception as e:
+        logging.error(f'Error reading Excel file: {e}')
+        raise
+
+def safe_write_excel(df, file_path):
+    try:
+        df.to_excel(file_path, index=False)
+        logging.info(f'Results written to: {file_path}')
+    except Exception as e:
+        logging.error(f'Error writing to Excel: {e}')
+        raise
+
+def calculate_iqr(df):
+    try:
+        df['Q1'] = df.groupby(group_column)[metric_column].transform(lambda x: x.quantile(0.25))
+        df['Q3'] = df.groupby(group_column)[metric_column].transform(lambda x: x.quantile(0.75))
+        df['IQR'] = df['Q3'] - df['Q1']
+        df['IQR_Lower'] = df['Q1'] - iqr_multiplier * df['IQR']
+        df['IQR_Upper'] = df['Q3'] + iqr_multiplier * df['IQR']
+        df['IQR_Outlier'] = ~df[metric_column].between(df['IQR_Lower'], df['IQR_Upper'])
+    except Exception as e:
+        logging.error(f'IQR calculation error: {e}')
+        df['IQR_Outlier'] = False
+    return df
+
+def calculate_z_score(df):
+    try:
+        df['Mean'] = df.groupby(group_column)[metric_column].transform('mean')
+        df['StdDev'] = df.groupby(group_column)[metric_column].transform('std')
+        df['Z_score'] = (df[metric_column] - df['Mean']) / df['StdDev']
+        df['Z_Outlier'] = df['Z_score'].abs() > z_threshold
+    except Exception as e:
+        logging.error(f'Z-score calculation error: {e}')
+        df['Z_Outlier'] = False
+    return df
+
+def calculate_mad(df):
+    try:
+        df['Median'] = df.groupby(group_column)[metric_column].transform('median')
+        df['Absolute_Deviation'] = (df[metric_column] - df['Median']).abs()
+        df['MAD'] = df.groupby(group_column)['Absolute_Deviation'].transform('median')
+        df['MAD_Score'] = df['Absolute_Deviation'] / (df['MAD'] * 1.4826)
+        df['MAD_Outlier'] = df['MAD_Score'] > mad_threshold
+    except Exception as e:
+        logging.error(f'MAD calculation error: {e}')
+        df['MAD_Outlier'] = False
+    return df
+
+def calculate_moving_average(df):
+    try:
+        df = df.sort_values(by=[group_column, date_column])
+        df['Rolling_Mean'] = df.groupby(group_column)[metric_column].transform(lambda x: x.rolling(window=rolling_window, min_periods=1).mean())
+        df['Rolling_StdDev'] = df.groupby(group_column)[metric_column].transform(lambda x: x.rolling(window=rolling_window, min_periods=1).std())
+        df['Rolling_Z_Score'] = (df[metric_column] - df['Rolling_Mean']) / df['Rolling_StdDev']
+        df['Rolling_Outlier'] = df['Rolling_Z_Score'].abs() > z_threshold
+    except Exception as e:
+        logging.error(f'Moving Average calculation error: {e}')
+        df['Rolling_Outlier'] = False
+    return df
+
+def clean_up(df):
+    # Replace NaN Z-score, StdDev, MAD with safe values
+    try:
+        df['Z_score'] = df['Z_score'].fillna(0)
+        df['StdDev'] = df['StdDev'].replace(0, np.nan).fillna(df['StdDev'].mean())
+        df['MAD_Score'] = df['MAD_Score'].fillna(0)
+        df['Rolling_Z_Score'] = df['Rolling_Z_Score'].fillna(0)
+    except Exception as e:
+        logging.error(f'Cleanup error: {e}')
+    return df
+
+# ================== Main Execution ==================
+if __name__ == "__main__":
+    try:
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        # Read input data
+        df = safe_read_excel(input_file, sheet_name)
+
+        # Apply all methods
+        df = calculate_iqr(df)
+        df = calculate_z_score(df)
+        df = calculate_mad(df)
+        df = calculate_moving_average(df)
+
+        # Clean up NaN and zero division issues
+        df = clean_up(df)
+
+        # Save final output
+        output_file = os.path.join(output_dir, f'outlier_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx')
+        safe_write_excel(df, output_file)
+
+        print(f'Outlier detection completed. Results saved to: {output_file}')
+
+    except Exception as e:
+        logging.critical(f'Fatal error in main execution: {e}')
+        print('Script failed. Check log file for details.')
