@@ -1,0 +1,188 @@
+import ibm_db
+import pandas as pd
+import numpy as np
+import os
+import logging
+import time
+import sys
+
+# =========================
+# Logger Setup
+# =========================
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"outlier_analysis_{time.strftime('%Y%m%d_%H%M%S')}.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# =========================
+# Outlier Detection Methods
+# =========================
+def calculate_iqr(df):
+    try:
+        q1 = df.groupby("ROUTINE_NAME")["ELP_MS_PER_EXEC"].transform(lambda x: x.quantile(0.25))
+        q3 = df.groupby("ROUTINE_NAME")["ELP_MS_PER_EXEC"].transform(lambda x: x.quantile(0.75))
+        iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+        df["IQR_Flag"] = np.where(
+            (df["ELP_MS_PER_EXEC"] < lower_bound) | (df["ELP_MS_PER_EXEC"] > upper_bound),
+            "Outlier", "Normal"
+        )
+        return df
+    except Exception as e:
+        logging.error(f"IQR calculation failed: {e}", exc_info=True)
+        return df
+
+def calculate_z_score(df):
+    try:
+        mean_val = df.groupby("ROUTINE_NAME")["ELP_MS_PER_EXEC"].transform("mean")
+        std_val = df.groupby("ROUTINE_NAME")["ELP_MS_PER_EXEC"].transform("std")
+        df["Z_Score"] = (df["ELP_MS_PER_EXEC"] - mean_val) / std_val
+        df["ZScore_Flag"] = np.where(abs(df["Z_Score"]) > 3, "Outlier", "Normal")
+        return df
+    except Exception as e:
+        logging.error(f"Z-score calculation failed: {e}", exc_info=True)
+        return df
+
+def calculate_mad(df):
+    try:
+        median_val = df.groupby("ROUTINE_NAME")["ELP_MS_PER_EXEC"].transform("median")
+        mad_val = df.groupby("ROUTINE_NAME")["ELP_MS_PER_EXEC"].transform(
+            lambda x: np.median(np.abs(x - np.median(x)))
+        )
+        df["MAD_Score"] = np.where(
+            mad_val != 0,
+            abs(df["ELP_MS_PER_EXEC"] - median_val) / mad_val,
+            np.nan
+        )
+        df["MAD_Flag"] = np.where(df["MAD_Score"] > 3, "Outlier", "Normal")
+        return df
+    except Exception as e:
+        logging.error(f"MAD calculation failed: {e}", exc_info=True)
+        return df
+
+def calculate_moving_average(df, window=5):
+    try:
+        df = df.sort_values(by=["ROUTINE_NAME", "DATE", "HOUR", "MINUTE"])
+        df["Moving_Avg"] = df.groupby("ROUTINE_NAME")["ELP_MS_PER_EXEC"].transform(
+            lambda x: x.rolling(window, min_periods=1).mean()
+        )
+        df["MovAvg_Flag"] = np.where(
+            abs(df["ELP_MS_PER_EXEC"] - df["Moving_Avg"]) > 3 * df.groupby("ROUTINE_NAME")["ELP_MS_PER_EXEC"].transform("std"),
+            "Outlier", "Normal"
+        )
+        return df
+    except Exception as e:
+        logging.error(f"Moving Average calculation failed: {e}", exc_info=True)
+        return df
+
+# =========================
+# DB2 Fetch Function
+# =========================
+def fetch_data_from_db2():
+    try:
+        dsn_hostname = "your_host"
+        dsn_uid = "your_user"
+        dsn_pwd = "your_password"
+        dsn_database = "your_db"
+        dsn_port = "50000"
+        dsn_protocol = "TCPIP"
+
+        db2_query = """
+        SELECT DATE, HOUR, MINUTE, ROUTINE_NAME, TOTAL_TIME_ROUTINE_INVOKED, ELP_MS_PER_EXEC
+        FROM your_table
+        """
+
+        dsn = f"DATABASE={dsn_database};HOSTNAME={dsn_hostname};PORT={dsn_port};PROTOCOL={dsn_protocol};UID={dsn_uid};PWD={dsn_pwd};"
+        conn = ibm_db.connect(dsn, "", "")
+        logging.info("✅ Connected to DB2")
+
+        stmt = ibm_db.exec_immediate(conn, db2_query)
+        result = []
+        row = ibm_db.fetch_assoc(stmt)
+        while row:
+            result.append(row)
+            row = ibm_db.fetch_assoc(stmt)
+        ibm_db.close(conn)
+
+        if not result:
+            logging.warning("No data retrieved from DB2.")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(result)
+        logging.info(f"✅ Retrieved {len(df)} rows from DB2")
+        return df
+
+    except Exception as e:
+        logging.critical(f"DB2 fetch failed: {e}", exc_info=True)
+        return pd.DataFrame()
+
+# =========================
+# Data Preparation
+# =========================
+def prepare_data(df):
+    try:
+        required_columns = ['DATE', 'HOUR', 'MINUTE', 'ROUTINE_NAME', 'TOTAL_TIME_ROUTINE_INVOKED', 'ELP_MS_PER_EXEC']
+        if not all(col in df.columns for col in required_columns):
+            raise ValueError(f"Missing expected columns in data: {df.columns}")
+
+        for col in ["ELP_MS_PER_EXEC", "TOTAL_TIME_ROUTINE_INVOKED"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
+
+        df.dropna(subset=["ELP_MS_PER_EXEC"], inplace=True)
+        df["Valid_Row"] = df["TOTAL_TIME_ROUTINE_INVOKED"] > 20
+        df = df[df["Valid_Row"]].copy()
+
+        return df
+    except Exception as e:
+        logging.critical(f"Data preparation failed: {e}", exc_info=True)
+        return pd.DataFrame()
+
+# =========================
+# Export Results
+# =========================
+def export_results(df):
+    try:
+        output_dir = "outlier_results"
+        os.makedirs(output_dir, exist_ok=True)
+
+        with pd.ExcelWriter(f"{output_dir}/final_outlier_analysis.xlsx") as writer:
+            df.to_excel(writer, sheet_name="All_Methods_Results", index=False)
+
+        logging.info("✅ Results successfully exported")
+    except Exception as e:
+        logging.error(f"Export failed: {e}", exc_info=True)
+
+# =========================
+# Main
+# =========================
+def main():
+    logging.info("===== Script Started =====")
+    df = fetch_data_from_db2()
+    if df.empty:
+        logging.error("No data to process.")
+        return
+
+    df = prepare_data(df)
+    if df.empty:
+        logging.error("Data preparation returned no valid rows.")
+        return
+
+    df = calculate_iqr(df)
+    df = calculate_z_score(df)
+    df = calculate_mad(df)
+    df = calculate_moving_average(df)
+
+    export_results(df)
+    logging.info("===== Script Completed Successfully =====")
+
+if __name__ == "__main__":
+    main()
