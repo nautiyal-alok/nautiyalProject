@@ -1,0 +1,385 @@
+import ibm_db
+import pandas as pd
+import numpy as np
+import os
+import logging
+import time
+import sys
+
+# =========================
+# Logger Setup
+# =========================
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"outlier_analysis_{time.strftime('%Y%m%d_%H%M%S')}.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# =========================
+# Outlier Detection Methods
+# =========================
+def calculate_iqr(df: pd.DataFrame) -> pd.DataFrame:
+    """IQR outlier flag per ROUTINE_NAME."""
+    try:
+        q1 = df.groupby("ROUTINE_NAME")["ELP_MS_PER_EXEC"].transform(lambda x: x.quantile(0.25))
+        q3 = df.groupby("ROUTINE_NAME")["ELP_MS_PER_EXEC"].transform(lambda x: x.quantile(0.75))
+        iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+        df["IQR_Flag"] = np.where(
+            (df["ELP_MS_PER_EXEC"] < lower_bound) | (df["ELP_MS_PER_EXEC"] > upper_bound),
+            "Outlier", "Normal"
+        )
+        logging.info("✅ IQR calculation done")
+    except Exception as e:
+        logging.error(f"❌ IQR calculation failed: {e}", exc_info=True)
+    return df
+
+def calculate_z_score(df: pd.DataFrame) -> pd.DataFrame:
+    """Z-score outlier flag per ROUTINE_NAME (|Z| > 3)."""
+    try:
+        mean_val = df.groupby("ROUTINE_NAME")["ELP_MS_PER_EXEC"].transform("mean")
+        std_val = df.groupby("ROUTINE_NAME")["ELP_MS_PER_EXEC"].transform("std")
+        std_val = std_val.replace(0, np.nan)
+        df["Z_Score"] = (df["ELP_MS_PER_EXEC"] - mean_val) / std_val
+        df["ZScore_Flag"] = np.where(df["Z_Score"].abs() > 3, "Outlier", "Normal")
+        logging.info("✅ Z-score calculation done")
+    except Exception as e:
+        logging.error(f"❌ Z-score calculation failed: {e}", exc_info=True)
+    return df
+
+def calculate_mad(df: pd.DataFrame) -> pd.DataFrame:
+    """Median Absolute Deviation based flag per ROUTINE_NAME (score > 3)."""
+    try:
+        med = df.groupby("ROUTINE_NAME")["ELP_MS_PER_EXEC"].transform("median")
+        mad = df.groupby("ROUTINE_NAME")["ELP_MS_PER_EXEC"].transform(
+            lambda x: np.median(np.abs(x - np.median(x)))
+        )
+        mad = mad.replace(0, np.nan)
+        df["MAD_Score"] = np.abs(df["ELP_MS_PER_EXEC"] - med) / mad
+        df["MAD_Flag"] = np.where(df["MAD_Score"] > 3, "Outlier", "Normal")
+        logging.info("✅ MAD calculation done")
+    except Exception as e:
+        logging.error(f"❌ MAD calculation failed: {e}", exc_info=True)
+    return df
+
+def calculate_moving_average(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
+    """
+    Simple moving average deviation per ROUTINE_NAME.
+    Flags points outside mean±3*std of rolling window (uses population std baseline by group).
+    """
+    try:
+        # stable sort so time order within routine is respected
+        df = df.sort_values(by=["ROUTINE_NAME", "DATE", "HOUR", "MINUTE"], kind="mergesort")
+        # rolling mean within routine
+        df["Moving_Avg"] = df.groupby("ROUTINE_NAME")["ELP_MS_PER_EXEC"] \
+                             .transform(lambda x: x.rolling(window, min_periods=1).mean())
+        # use group std as a robust baseline (rolling std can be too noisy at edges)
+        grp_std = df.groupby("ROUTINE_NAME")["ELP_MS_PER_EXEC"].transform("std").replace(0, np.nan)
+        df["MovAvg_Flag"] = np.where(
+            (df["ELP_MS_PER_EXEC"] > (df["Moving_Avg"] + 3 * grp_std)) |
+            (df["ELP_MS_PER_EXEC"] < (df["Moving_Avg"] - 3 * grp_std)),
+            "Outlier", "Normal"
+        )
+        logging.info("✅ Moving Average calculation done")
+    except Exception as e:
+        logging.error(f"❌ Moving Average calculation failed: {e}", exc_info=True)
+    return df
+
+# =========================
+# DB2 Fetch + Prep
+# =========================
+def fetch_data_from_db2() -> pd.DataFrame:
+    """Pull data from DB2 using your SQL and return as DataFrame."""
+    try:
+        # --- Update these ---
+        dsn_hostname = "your_host"
+        dsn_uid = "your_user"
+        dsn_pwd = "your_password"
+        dsn_database = "your_db"
+        dsn_port = "50000"
+        dsn_protocol = "TCPIP"
+        table_name = "your_table"
+        # --------------------
+
+        db2_query = f"""
+        SELECT DATE, HOUR, MINUTE, ROUTINE_NAME, TOTAL_TIME_ROUTINE_INVOKED, ELP_MS_PER_EXEC
+        FROM {table_name}
+        """
+
+        dsn = (
+            f"DATABASE={dsn_database};HOSTNAME={dsn_hostname};PORT={dsn_port};"
+            f"PROTOCOL={dsn_protocol};UID={dsn_uid};PWD={dsn_pwd};"
+        )
+        conn = ibm_db.connect(dsn, "", "")
+        logging.info("✅ Connected to DB2")
+
+        stmt = ibm_db.exec_immediate(conn, db2_query)
+        result = []
+        row = ibm_db.fetch_assoc(stmt)
+        while row:
+            result.append(row)
+            row = ibm_db.fetch_assoc(stmt)
+
+        try:
+            ibm_db.close(conn)
+        except Exception:
+            pass
+
+        if not result:
+            logging.warning("❌ No data retrieved from DB2.")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(result)
+        logging.info(f"✅ Retrieved {len(df)} rows from DB2")
+        return df
+
+    except Exception as e:
+        logging.critical(f"❌ DB2 fetch failed: {e}", exc_info=True)
+        return pd.DataFrame()
+
+def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Type coercion, validity filtering, and time fields."""
+    try:
+        req = ['DATE', 'HOUR', 'MINUTE', 'ROUTINE_NAME', 'TOTAL_TIME_ROUTINE_INVOKED', 'ELP_MS_PER_EXEC']
+        if not all(c in df.columns for c in req):
+            raise ValueError(f"Missing expected columns. Found: {list(df.columns)}")
+
+        # coerce numerics
+        df['ELP_MS_PER_EXEC'] = pd.to_numeric(df['ELP_MS_PER_EXEC'], errors='coerce').astype('float32')
+        df['TOTAL_TIME_ROUTINE_INVOKED'] = pd.to_numeric(df['TOTAL_TIME_ROUTINE_INVOKED'], errors='coerce').astype('float32')
+
+        before = len(df)
+        df = df.dropna(subset=['ELP_MS_PER_EXEC'])
+        logging.info(f"🧹 Dropped {before - len(df)} rows with NaN ELP_MS_PER_EXEC")
+
+        # validity: invoked > 20 (as per your earlier logic)
+        df['Valid_Row'] = df['TOTAL_TIME_ROUTINE_INVOKED'] > 20
+        df = df[df['Valid_Row']].copy()
+
+        # create a sortable timestamp for summaries
+        df['DATETIME'] = pd.to_datetime(
+            df['DATE'].astype(str).str.strip() + ' ' +
+            df['HOUR'].astype(str).str.zfill(2) + ':' +
+            df['MINUTE'].astype(str).str.zfill(2),
+            errors='coerce'
+        )
+
+        return df
+    except Exception as e:
+        logging.critical(f"❌ Data preparation failed: {e}", exc_info=True)
+        return pd.DataFrame()
+
+# =========================
+# Executive Summary Builder
+# =========================
+def build_executive_summary(df: pd.DataFrame) -> dict:
+    """
+    Returns dict of DataFrames:
+      - Summary_By_Routine
+      - Hot_Dates
+      - Hot_Hours
+      - Top20_Worst_Rows
+    """
+    try:
+        # Outlier strength = how many methods flagged this row
+        flags = (df[['IQR_Flag', 'ZScore_Flag', 'MAD_Flag', 'MovAvg_Flag']] == 'Outlier')
+        df['Outlier_Strength'] = flags.sum(axis=1).astype('int16')
+
+        # Severity ratio (vs per-routine median); robust and always present
+        routine_median = df.groupby('ROUTINE_NAME')['ELP_MS_PER_EXEC'].transform('median')
+        df['Severity_Ratio'] = df['ELP_MS_PER_EXEC'] / (routine_median.replace(0, np.nan))
+
+        # Per-routine summary
+        # Handle cases where Z_Score may be NaN due to zero std
+        def _safe_max(s):
+            try:
+                return np.nanmax(pd.to_numeric(s, errors='coerce').values)
+            except Exception:
+                return np.nan
+
+        def _safe_mean(s):
+            try:
+                return np.nanmean(pd.to_numeric(s, errors='coerce').values)
+            except Exception:
+                return np.nan
+
+        outlier_mask = df['Outlier_Strength'] >= 1
+        any_out = df[outlier_mask].copy()
+
+        summary_by_routine = any_out.groupby('ROUTINE_NAME').agg(
+            First_Seen=('DATETIME', 'min'),
+            Last_Seen=('DATETIME', 'max'),
+            Total_Outliers=('DATETIME', 'count'),
+            Max_Severity_Ratio=('Severity_Ratio', _safe_max),
+            Avg_Z_Score=('Z_Score', _safe_mean),
+            Avg_Outlier_Strength=('Outlier_Strength', 'mean')
+        ).reset_index().sort_values(
+            by=['Total_Outliers', 'Max_Severity_Ratio'], ascending=[False, False]
+        )
+
+        # Hotspot dates & hours (count of strong outliers)
+        strong = df[df['Outlier_Strength'] >= 3]
+        hot_dates = strong.groupby('DATE').size().reset_index(name='Strong_Outlier_Count') \
+                          .sort_values('Strong_Outlier_Count', ascending=False)
+        hot_hours = strong.groupby('HOUR').size().reset_index(name='Strong_Outlier_Count') \
+                          .sort_values('Strong_Outlier_Count', ascending=False)
+
+        # Top 20 worst rows by Severity_Ratio, then by Outlier_Strength
+        top20 = df[df['Outlier_Strength'] >= 1].copy()
+        top20 = top20.sort_values(
+            by=['Outlier_Strength', 'Severity_Ratio', 'ELP_MS_PER_EXEC'],
+            ascending=[False, False, False]
+        ).head(20)
+
+        return {
+            'Summary_By_Routine': summary_by_routine,
+            'Hot_Dates': hot_dates,
+            'Hot_Hours': hot_hours,
+            'Top20_Worst_Rows': top20
+        }
+
+    except Exception as e:
+        logging.error(f"❌ Executive summary build failed: {e}", exc_info=True)
+        # return safe minimal outputs
+        return {
+            'Summary_By_Routine': pd.DataFrame(),
+            'Hot_Dates': pd.DataFrame(),
+            'Hot_Hours': pd.DataFrame(),
+            'Top20_Worst_Rows': pd.DataFrame()
+        }
+
+# =========================
+# Export
+# =========================
+def export_results_with_summary(df: pd.DataFrame, summary_dict: dict):
+    try:
+        output_dir = "outlier_results"
+        os.makedirs(output_dir, exist_ok=True)
+        xlsx_path = os.path.join(output_dir, "final_outlier_analysis.xlsx")
+
+        with pd.ExcelWriter(xlsx_path, engine="xlsxwriter") as writer:
+            # Detailed data (all methods)
+            df.to_excel(writer, sheet_name="All_Methods_Results", index=False)
+
+            # Executive summaries (each on its own sheet)
+            for name, sdf in summary_dict.items():
+                if not sdf.empty:
+                    sdf.to_excel(writer, sheet_name=name[:31], index=False)
+
+            # Optional: light conditional formatting on the detailed sheet
+            try:
+                wb = writer.book
+                ws = writer.sheets["All_Methods_Results"]
+
+                # Find columns by name safely
+                cols = {c: i for i, c in enumerate(df.columns)}
+                # Color rows by Outlier_Strength using a 3-color scale
+                if 'Outlier_Strength' in cols:
+                    last_row = len(df) + 1
+                    col_idx = cols['Outlier_Strength']
+                    col_letter = xlsx_col_letter(col_idx)
+                    ws.conditional_format(
+                        f"{col_letter}2:{col_letter}{last_row}",
+                        {
+                            'type': '3_color_scale',
+                            'min_color': "#63BE7B",  # green (low)
+                            'mid_color': "#FFEB84",  # yellow
+                            'max_color': "#F8696B"   # red (high)
+                        }
+                    )
+                # Highlight flags columns
+                for flag_col in ["IQR_Flag", "ZScore_Flag", "MAD_Flag", "MovAvg_Flag"]:
+                    if flag_col in cols:
+                        cidx = cols[flag_col]
+                        col_letter = xlsx_col_letter(cidx)
+                        ws.conditional_format(
+                            f"{col_letter}2:{col_letter}{len(df)+1}",
+                            {
+                                'type': 'text',
+                                'criteria': 'containing',
+                                'value': 'Outlier',
+                                'format': wb.add_format({'bg_color': '#FFC7CE'})
+                            }
+                        )
+            except Exception as fe:
+                logging.warning(f"Excel formatting skipped: {fe}")
+
+        logging.info(f"✅ Results exported: {xlsx_path}")
+    except ImportError:
+        # Fallback if xlsxwriter not installed
+        output_dir = "outlier_results"
+        os.makedirs(output_dir, exist_ok=True)
+        csv_path = os.path.join(output_dir, "final_outlier_analysis.csv")
+        df.to_csv(csv_path, index=False)
+        for name, sdf in summary_dict.items():
+            if not sdf.empty:
+                sdf.to_csv(os.path.join(output_dir, f"{name}.csv"), index=False)
+        logging.warning("xlsxwriter not found; wrote CSVs instead.")
+    except Exception as e:
+        logging.error(f"❌ Export failed: {e}", exc_info=True)
+
+def xlsx_col_letter(idx_zero_based: int) -> str:
+    """Convert 0-based column index to Excel column letters (A, B, ...)."""
+    idx = idx_zero_based + 1
+    letters = ""
+    while idx:
+        idx, rem = divmod(idx - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+# =========================
+# Main
+# =========================
+def main():
+    logging.info("===== Script Started =====")
+    df = fetch_data_from_db2()
+    if df.empty:
+        logging.error("No data to process.")
+        return
+
+    df = prepare_data(df)
+    if df.empty:
+        logging.error("Data preparation returned no valid rows.")
+        return
+
+    # Apply four methods sequentially
+    df = calculate_iqr(df)
+    df = calculate_z_score(df)
+    df = calculate_mad(df)
+    df = calculate_moving_average(df, window=5)
+
+    # Build Executive Summary
+    summary = build_executive_summary(df)
+
+    # Export all
+    export_results_with_summary(df, summary)
+    logging.info("===== Script Completed Successfully =====")
+
+if __name__ == "__main__":
+    main()
+
+How to read the Excel
+All_Methods_Results: every row with IQR_Flag, ZScore_Flag, MAD_Flag, MovAvg_Flag, Z_Score, MAD_Score, Moving_Avg, plus:
+
+Outlier_Strength → how many methods flagged it (0–4).
+
+Severity_Ratio → how big it is vs routine median (higher = worse).
+
+Summary_By_Routine: for each routine, when anomalies started (First_Seen), how persistent (Last_Seen, Total_Outliers), and how severe (Max_Severity_Ratio, Avg_Z_Score, Avg_Outlier_Strength).
+
+Hot_Dates / Hot_Hours: where the strongest (3+ methods) outliers cluster.
+
+Top20_Worst_Rows: the single worst offenders by severity & consensus.
+
+If you want me to fold in your weighted score + severity labels we discussed earlier, I can extend this with one more column (Weightage_Score + Severity_Label) without changing the rest.
+
+
+
